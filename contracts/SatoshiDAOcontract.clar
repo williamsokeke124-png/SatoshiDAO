@@ -123,3 +123,179 @@
     (ok true)
   )
 )
+
+
+;; Unlock BTC after lock period expires
+(define-public (unlock-btc)
+  (let (
+    (sender tx-sender)
+    (lock-info (unwrap! (map-get? btc-locks { user: sender }) ERR-NOT-AUTHORIZED))
+  )
+    (asserts! (get active lock-info) ERR-NOT-AUTHORIZED)
+    (asserts! (>= block-height (get unlock-height lock-info)) ERR-UNLOCK-NOT-READY)
+    
+    ;; Burn voting tokens
+    (try! (ft-burn? satoshi-vote-token (* (get amount lock-info) VOTE-TOKEN-MULTIPLIER) sender))
+    
+    ;; Return BTC (STX in this simulation)
+    (try! (as-contract (stx-transfer? (get amount lock-info) tx-sender sender)))
+    
+    ;; Mark lock as inactive
+    (map-set btc-locks
+      { user: sender }
+      {
+        amount: (get amount lock-info),
+        lock-height: (get lock-height lock-info),
+        unlock-height: (get unlock-height lock-info),
+        active: false
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Create a new proposal
+(define-public (create-proposal (title (string-ascii 100)) (description (string-utf8 500)) 
+                               (voting-duration uint) (treasury-amount uint) (recipient (optional principal)))
+  (let (
+    (sender tx-sender)
+    (proposal-id (+ (var-get proposal-count) u1))
+    (current-height block-height)
+    (voting-start (+ current-height u144)) ;; ~24 hours delay
+    (voting-end (+ voting-start voting-duration))
+    (sender-balance (ft-get-balance satoshi-vote-token sender))
+  )
+    (asserts! (get contract-active (var-get contract-active)) (err u200))
+    (asserts! (not (var-get emergency-pause)) (err u201))
+    (asserts! (>= sender-balance MIN-PROPOSAL-THRESHOLD) ERR-INSUFFICIENT-VOTING-POWER)
+    (asserts! (>= voting-duration MIN-VOTING-PERIOD) (err u203))
+    (asserts! (<= voting-duration MAX-VOTING-PERIOD) (err u204))
+    (asserts! (<= treasury-amount (var-get treasury-balance)) (err u205))
+    
+    (map-set proposals
+      { id: proposal-id }
+      {
+        proposer: sender,
+        title: title,
+        description: description,
+        voting-start: voting-start,
+        voting-end: voting-end,
+        yes-votes: u0,
+        no-votes: u0,
+        executed: false,
+        cancelled: false,
+        treasury-amount: treasury-amount,
+        recipient: recipient
+      }
+    )
+    
+    (var-set proposal-count proposal-id)
+    (ok proposal-id)
+  )
+)
+
+;; Vote on a proposal
+(define-public (vote (proposal-id uint) (support bool))
+  (let (
+    (sender tx-sender)
+    (proposal (unwrap! (map-get? proposals { id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+    (current-height block-height)
+    (voting-power (ft-get-balance satoshi-vote-token sender))
+    (existing-vote (map-get? votes { proposal-id: proposal-id, voter: sender }))
+  )
+    (asserts! (get contract-active (var-get contract-active)) (err u200))
+    (asserts! (not (var-get emergency-pause)) (err u201))
+    (asserts! (is-none existing-vote) ERR-ALREADY-VOTED)
+    (asserts! (>= current-height (get voting-start proposal)) (err u206))
+    (asserts! (< current-height (get voting-end proposal)) ERR-PROPOSAL-EXPIRED)
+    (asserts! (> voting-power u0) ERR-INSUFFICIENT-VOTING-POWER)
+    (asserts! (not (get executed proposal)) (err u207))
+    (asserts! (not (get cancelled proposal)) (err u208))
+    
+    ;; Record the vote
+    (map-set votes
+      { proposal-id: proposal-id, voter: sender }
+      {
+        vote: support,
+        voting-power: voting-power,
+        block-height: current-height
+      }
+    )
+    
+    ;; Update proposal vote counts
+    (map-set proposals
+      { id: proposal-id }
+      (merge proposal {
+        yes-votes: (if support 
+                     (+ (get yes-votes proposal) voting-power)
+                     (get yes-votes proposal)),
+        no-votes: (if support 
+                    (get no-votes proposal)
+                    (+ (get no-votes proposal) voting-power))
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Execute a passed proposal
+(define-public (execute-proposal (proposal-id uint))
+  (let (
+    (proposal (unwrap! (map-get? proposals { id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+    (current-height block-height)
+    (yes-votes (get yes-votes proposal))
+    (no-votes (get no-votes proposal))
+    (total-votes (+ yes-votes no-votes))
+  )
+    (asserts! (get contract-active (var-get contract-active)) (err u200))
+    (asserts! (not (var-get emergency-pause)) (err u201))
+    (asserts! (>= current-height (get voting-end proposal)) ERR-VOTING-PERIOD-ACTIVE)
+    (asserts! (not (get executed proposal)) (err u209))
+    (asserts! (not (get cancelled proposal)) (err u208))
+    (asserts! (> yes-votes no-votes) (err u210))
+    (asserts! (> total-votes u0) (err u211))
+    
+    ;; Execute treasury transfer if specified
+    (if (> (get treasury-amount proposal) u0)
+      (match (get recipient proposal)
+        recipient-addr (try! (as-contract (stx-transfer? (get treasury-amount proposal) tx-sender recipient-addr)))
+        (err u212)
+      )
+      true
+    )
+    
+    ;; Update treasury balance
+    (var-set treasury-balance (- (var-get treasury-balance) (get treasury-amount proposal)))
+    
+    ;; Mark proposal as executed
+    (map-set proposals
+      { id: proposal-id }
+      (merge proposal { executed: true })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Add funds to treasury (only owner)
+(define-public (add-to-treasury (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set treasury-balance (+ (var-get treasury-balance) amount))
+    (ok true)
+  )
+)
+
+;; Emergency pause (only owner)
+(define-public (toggle-emergency-pause)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (var-set emergency-pause (not (var-get emergency-pause)))
+    (ok (var-get emergency-pause))
+  )
+)
