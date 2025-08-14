@@ -85,24 +85,33 @@
   { power: uint }
 )
 
+
 ;; public functions
 
 ;; Lock BTC and receive voting tokens
-(define-public (lock-btc (amount uint) (lock-period uint))
-  (let
-    (
-      (user tx-sender)
-      (current-height (get-block-height))
-      (unlock-height (+ current-height lock-period))
-    )
+(define-public (lock-btc (amount uint) (lock-duration uint))
+  (let (
+    (sender tx-sender)
+    (current-height block-height)
+    (unlock-height (+ current-height lock-duration))
+    (existing-lock (map-get? btc-locks { user: sender }))
+  )
+    (asserts! (get contract-active (var-get contract-active)) (err u200))
+    (asserts! (not (var-get emergency-pause)) (err u201))
     (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-    (asserts! (>= lock-period MIN-VOTING-PERIOD) ERR-INVALID-AMOUNT)
-    (asserts! (<= lock-period MAX-VOTING-PERIOD) ERR-INVALID-AMOUNT)
-    (asserts! (is-eq (get active (default-to { amount: u0, lock-height: u0, unlock-height: u0, active: false } (map-get? btc-locks { user: user }))) false) ERR-BTC-LOCKED)
+    (asserts! (>= lock-duration MIN-VOTING-PERIOD) (err u202))
+    (asserts! (is-none existing-lock) ERR-BTC-LOCKED)
     
-    ;; Store lock information
+    ;; In a real implementation, this would interact with Bitcoin network
+    ;; For now, we simulate BTC transfer
+    (try! (stx-transfer? amount sender (as-contract tx-sender)))
+    
+    ;; Mint voting tokens
+    (try! (ft-mint? satoshi-vote-token (* amount VOTE-TOKEN-MULTIPLIER) sender))
+    
+    ;; Record the BTC lock
     (map-set btc-locks
-      { user: user }
+      { user: sender }
       {
         amount: amount,
         lock-height: current-height,
@@ -111,46 +120,6 @@
       }
     )
     
-    ;; Mint voting tokens
-    (ft-mint? satoshi-vote-token (* amount VOTE-TOKEN-MULTIPLIER) user)
-  )
-)
-
-;; Create a new proposal
-(define-public (create-proposal (title (string-ascii 100)) (description (string-utf8 500)) (voting-period uint) (treasury-amount uint) (recipient (optional principal)))
-  (let
-    (
-      (user tx-sender)
-      (user-balance (unwrap! (ft-get-balance satoshi-vote-token user) ERR-INSUFFICIENT-BALANCE))
-      (proposal-id (var-get proposal-count))
-      (current-height (get-block-height))
-      (voting-end (+ current-height voting-period))
-    )
-    ;; Check requirements
-    (asserts! (>= user-balance MIN-PROPOSAL-THRESHOLD) ERR-INSUFFICIENT-VOTING-POWER)
-    (asserts! (>= voting-period MIN-VOTING-PERIOD) ERR-INVALID-AMOUNT)
-    (asserts! (<= voting-period MAX-VOTING-PERIOD) ERR-INVALID-AMOUNT)
-    
-    ;; Create proposal
-    (map-set proposals
-      { id: proposal-id }
-      {
-        proposer: user,
-        title: title,
-        description: description,
-        voting-start: current-height,
-        voting-end: voting-end,
-        yes-votes: u0,
-        no-votes: u0,
-        executed: false,
-        cancelled: false,
-        treasury-amount: treasury-amount,
-        recipient: recipient
-      }
-    )
-    
-    ;; Increment proposal counter
-    (var-set proposal-count (+ proposal-id u1))
-    (ok proposal-id)
+    (ok true)
   )
 )
