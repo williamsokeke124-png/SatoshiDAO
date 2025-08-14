@@ -92,11 +92,11 @@
 (define-public (lock-btc (amount uint) (lock-duration uint))
   (let (
     (sender tx-sender)
-    (current-height block-height)
+    (current-height stacks-block-height)
     (unlock-height (+ current-height lock-duration))
     (existing-lock (map-get? btc-locks { user: sender }))
   )
-    (asserts! (get contract-active (var-get contract-active)) (err u200))
+    (asserts! (var-get contract-active) (err u200))
     (asserts! (not (var-get emergency-pause)) (err u201))
     (asserts! (> amount u0) ERR-INVALID-AMOUNT)
     (asserts! (>= lock-duration MIN-VOTING-PERIOD) (err u202))
@@ -132,7 +132,7 @@
     (lock-info (unwrap! (map-get? btc-locks { user: sender }) ERR-NOT-AUTHORIZED))
   )
     (asserts! (get active lock-info) ERR-NOT-AUTHORIZED)
-    (asserts! (>= block-height (get unlock-height lock-info)) ERR-UNLOCK-NOT-READY)
+    (asserts! (>= stacks-block-height (get unlock-height lock-info)) ERR-UNLOCK-NOT-READY)
     
     ;; Burn voting tokens
     (try! (ft-burn? satoshi-vote-token (* (get amount lock-info) VOTE-TOKEN-MULTIPLIER) sender))
@@ -161,12 +161,12 @@
   (let (
     (sender tx-sender)
     (proposal-id (+ (var-get proposal-count) u1))
-    (current-height block-height)
+    (current-height stacks-block-height)
     (voting-start (+ current-height u144)) ;; ~24 hours delay
     (voting-end (+ voting-start voting-duration))
     (sender-balance (ft-get-balance satoshi-vote-token sender))
   )
-    (asserts! (get contract-active (var-get contract-active)) (err u200))
+    (asserts! (var-get contract-active) (err u200))
     (asserts! (not (var-get emergency-pause)) (err u201))
     (asserts! (>= sender-balance MIN-PROPOSAL-THRESHOLD) ERR-INSUFFICIENT-VOTING-POWER)
     (asserts! (>= voting-duration MIN-VOTING-PERIOD) (err u203))
@@ -200,11 +200,11 @@
   (let (
     (sender tx-sender)
     (proposal (unwrap! (map-get? proposals { id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
-    (current-height block-height)
+    (current-height stacks-block-height)
     (voting-power (ft-get-balance satoshi-vote-token sender))
     (existing-vote (map-get? votes { proposal-id: proposal-id, voter: sender }))
   )
-    (asserts! (get contract-active (var-get contract-active)) (err u200))
+    (asserts! (var-get contract-active) (err u200))
     (asserts! (not (var-get emergency-pause)) (err u201))
     (asserts! (is-none existing-vote) ERR-ALREADY-VOTED)
     (asserts! (>= current-height (get voting-start proposal)) (err u206))
@@ -244,12 +244,13 @@
 (define-public (execute-proposal (proposal-id uint))
   (let (
     (proposal (unwrap! (map-get? proposals { id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
-    (current-height block-height)
+    (current-height stacks-block-height)
     (yes-votes (get yes-votes proposal))
     (no-votes (get no-votes proposal))
     (total-votes (+ yes-votes no-votes))
+    (treasury-amount (get treasury-amount proposal))
   )
-    (asserts! (get contract-active (var-get contract-active)) (err u200))
+    (asserts! (var-get contract-active) (err u200))
     (asserts! (not (var-get emergency-pause)) (err u201))
     (asserts! (>= current-height (get voting-end proposal)) ERR-VOTING-PERIOD-ACTIVE)
     (asserts! (not (get executed proposal)) (err u209))
@@ -258,16 +259,19 @@
     (asserts! (> total-votes u0) (err u211))
     
     ;; Execute treasury transfer if specified
-    (if (> (get treasury-amount proposal) u0)
-      (match (get recipient proposal)
-        recipient-addr (try! (as-contract (stx-transfer? (get treasury-amount proposal) tx-sender recipient-addr)))
-        (err u212)
+    (if (> treasury-amount u0)
+      (begin
+        ;; Check if recipient is provided
+        (asserts! (is-some (get recipient proposal)) (err u212))
+        ;; Execute the transfer
+        (try! (as-contract (stx-transfer? treasury-amount tx-sender (unwrap! (get recipient proposal) (err u212)))))
+        true
       )
       true
     )
     
     ;; Update treasury balance
-    (var-set treasury-balance (- (var-get treasury-balance) (get treasury-amount proposal)))
+    (var-set treasury-balance (- (var-get treasury-balance) treasury-amount))
     
     ;; Mark proposal as executed
     (map-set proposals
@@ -300,3 +304,19 @@
   )
 )
 
+
+;; private functions
+
+;; Calculate voting power at a specific block height (for future use)
+(define-private (calculate-voting-power-at-height (user principal) (height uint))
+  (ft-get-balance satoshi-vote-token user)
+)
+
+;; Validate proposal parameters
+(define-private (validate-proposal-params (voting-duration uint) (treasury-amount uint))
+  (and
+    (>= voting-duration MIN-VOTING-PERIOD)
+    (<= voting-duration MAX-VOTING-PERIOD)
+    (<= treasury-amount (var-get treasury-balance))
+  )
+)
